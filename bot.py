@@ -150,12 +150,16 @@ async def download_song(url, output_template=None):
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": output_template,
+            "writethumbnail": True,
             "postprocessors": [
                 {
                     "key": "FFmpegExtractAudio",
                     "preferredcodec": "mp3",
                     "preferredquality": "192",
-                }
+                },
+                {
+                    "key": "EmbedThumbnail",
+                },
             ],
             "quiet": True,
             "no_warnings": True,
@@ -163,7 +167,6 @@ async def download_song(url, output_template=None):
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             },
-            # No custom extractor_args — yt-dlp's SoundCloud extractor works fine with defaults
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -217,8 +220,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• `/status` — Bot status & next upload time\n"
         "• `/skip` — Skip today's pending songs\n"
         "• `/showsongs` — Show all songs in database\n"
-        "• `/addsong <url> <Artist - Title>` — Add a new song\n"
-        "• `/runscheduled` — Run the daily task now (test)\n\n"
+        "• `/addsong <url> <Artist - Title>` — Add a new song\\n"
+        "• `/upload <url>` — Download & upload directly\\n"
+        "• `/suggest <artist>` — List songs by an artist\\n"
+        "• `/runscheduled` — Run the daily task now (test)\\n\\n"
         f"⏰ **Daily upload:** 2 songs at {_get_schedule_time()}"
     )
     await update.message.reply_text(msg)
@@ -371,6 +376,136 @@ async def runscheduled(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("🔄 Running daily task now...")
     await daily_task(context)
+
+async def suggest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Suggest songs from a specific artist in the database."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/suggest <artist name>`\n"
+            "Example: `/suggest Shahin Najafi`"
+        )
+        return
+
+    artist_query = " ".join(context.args).strip().lower()
+    songs = load_songs()
+    history = load_history()
+    uploaded_ids = set(history.get("uploaded", []))
+    rejected_ids = set(history.get("rejected", []))
+
+    # Find matching songs (case-insensitive partial match)
+    matches = [s for s in songs if artist_query in s["artist"].lower()]
+
+    if not matches:
+        await update.message.reply_text(
+            f"❌ No songs found for artist **{artist_query.title()}** in the database."
+        )
+        return
+
+    msg_parts = [f"🎵 **Songs by {matches[0]['artist']}** ({len(matches)} total)\n"]
+    for i, s in enumerate(matches, 1):
+        status_icon = "✅" if s["url"] in uploaded_ids else "❌" if s["url"] in rejected_ids else "⬜"
+        msg_parts.append(f"{status_icon} {i}. **{s['title']}**")
+
+    full_msg = "\n".join(msg_parts)
+    if len(full_msg) > 4000:
+        for chunk in [full_msg[i:i+4000] for i in range(0, len(full_msg), 4000)]:
+            await update.message.reply_text(chunk)
+    else:
+        await update.message.reply_text(full_msg)
+
+async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download a SoundCloud URL and upload it directly to the channel (skip approval)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/upload <soundcloud_url>`\n"
+            "Example: `/upload https://soundcloud.com/artist/track`\n\n"
+            "Downloads the track and uploads it directly to the channel."
+        )
+        return
+
+    url = context.args[0]
+
+    if not url.startswith("http"):
+        await update.message.reply_text("❌ First argument must be a URL")
+        return
+    if "youtube.com" in url or "youtu.be" in url:
+        await update.message.reply_text("❌ YouTube URLs are not supported.")
+        return
+    if "soundcloud.com" not in url:
+        await update.message.reply_text("❌ Only SoundCloud URLs are supported.")
+        return
+
+    config = load_config()
+    channel = config.get("channel_id") or config.get("channel_username")
+    if not channel:
+        await update.message.reply_text("❌ No channel configured! Use /setchannel first.")
+        return
+
+    msg = await update.message.reply_text("⏬ **Downloading from SoundCloud...**")
+
+    # Download
+    result = await download_song(url)
+    if not result or not result[0]:
+        await msg.edit_text("❌ Download failed. Check the logs.")
+        return
+
+    file_path, info = result
+    title = info.get("title", "Unknown")
+    artist = info.get("artist") or info.get("uploader", "Unknown")
+    file_size = Path(file_path).stat().st_size
+
+    await msg.edit_text(f"⬆️ **Uploading to channel...**\n**{artist}** — **{title}** ({file_size / 1024 / 1024:.1f} MB)")
+
+    # Upload to channel
+    try:
+        channel_identifier = channel
+        if channel.startswith("@"):
+            pass
+        elif channel.startswith("-100"):
+            channel_identifier = int(channel)
+        elif channel.isdigit() or (channel.startswith("-") and channel[1:].isdigit()):
+            channel_identifier = int(channel)
+        else:
+            channel_identifier = channel
+
+        with open(file_path, "rb") as f:
+            await context.bot.send_audio(
+                chat_id=channel_identifier,
+                audio=f,
+                title=title,
+                performer=artist,
+                caption=f"🎵 {artist} — {title}\n#persianrap #oldschool",
+            )
+
+        await msg.edit_text(
+            f"✅ **Uploaded!**\n\n"
+            f"**{artist}** — **{title}**\n"
+            f"Sent to channel ✅"
+        )
+
+        # Add to uploaded history
+        song_entry = {"artist": artist, "title": title, "url": url, "source": "soundcloud"}
+        mark_uploaded(song_entry)
+
+        # Also add to songs database if not already there
+        songs = load_songs()
+        if not any(s["url"] == url for s in songs):
+            songs.append(song_entry)
+            save_json(SONGS_FILE, songs)
+
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        await msg.edit_text(f"❌ **Upload failed!**\nError: <code>{str(e)[:200]}</code>")
+        return
+
+    finally:
+        # Clean up
+        if Path(file_path).exists():
+            Path(file_path).unlink(missing_ok=True)
 
 async def setdaily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Set the daily schedule time."""
@@ -852,6 +987,8 @@ def main():
     app.add_handler(CommandHandler("showsongs", showsongs))
     app.add_handler(CommandHandler("addsong", addsong))
     app.add_handler(CommandHandler("runscheduled", runscheduled))
+    app.add_handler(CommandHandler("suggest", suggest))
+    app.add_handler(CommandHandler("upload", upload))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
 
