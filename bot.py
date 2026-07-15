@@ -163,8 +163,7 @@ async def download_song(url, output_template=None):
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             },
-            # SoundCloud-specific: prefer ogv streams (higher quality)
-            "extractor_args": {"soundcloud": {"formats": ["egostream", "hls"]}},
+            # No custom extractor_args — yt-dlp's SoundCloud extractor works fine with defaults
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
